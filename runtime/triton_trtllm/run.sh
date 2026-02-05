@@ -52,7 +52,8 @@ if [ $stage -le 1 ] && [ $stop_stage -ge 1 ]; then
     python3 ./scripts/test_llm.py --input_text "你好，请问你叫什么？" \
                     --tokenizer_dir $huggingface_model_local_dir \
                     --top_k 50 --top_p 0.95 --temperature 0.8 \
-                    --engine_dir=$trt_engines_dir  || exit 1
+                    --engine_dir=$trt_engines_dir \
+                    --kv_cache_free_gpu_memory_fraction 0.3  || exit 1
 fi
 
 if [ $stage -le 2 ] && [ $stop_stage -ge 2 ]; then
