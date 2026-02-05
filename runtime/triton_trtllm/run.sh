@@ -45,7 +45,7 @@ if [ $stage -le 1 ] && [ $stop_stage -ge 1 ]; then
     trtllm-build --checkpoint_dir $trt_weights_dir \
                 --output_dir $trt_engines_dir \
                 --max_batch_size 16 \
-                --max_num_tokens 32768 \
+                --max_num_tokens 8192 \
                 --gemm_plugin $trt_dtype || exit 1
 
     echo "Testing TensorRT engines"
