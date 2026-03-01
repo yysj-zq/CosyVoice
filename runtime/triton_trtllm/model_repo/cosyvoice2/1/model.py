@@ -84,7 +84,14 @@ class TritonPythonModel:
         if not os.path.exists(spk_info_path):
             raise ValueError(f"spk2info.pt not found in {model_params['model_dir']}")
         spk_info = torch.load(spk_info_path, map_location="cpu", weights_only=False)
-        self.default_spk_info = spk_info["001"]
+        # Cache all speaker infos and determine default speaker id
+        self.spk_info = spk_info
+        if "001" in spk_info:
+            self.default_spk_id = "001"
+        else:
+            # fall back to the first key in sorted order
+            self.default_spk_id = sorted(spk_info.keys())[0]
+        self.default_spk_info = spk_info[self.default_spk_id]
 
     def forward_llm(self, input_ids):
         """
@@ -325,6 +332,24 @@ class TritonPythonModel:
 
         for request in requests:
             request_id = request.request_id()
+            # Extract optional speaker id
+            speaker_id_tensor = pb_utils.get_input_tensor_by_name(request, "speaker_id")
+            speaker_id = None
+            if speaker_id_tensor is not None:
+                try:
+                    speaker_id_arr = speaker_id_tensor.as_numpy()
+                    raw_id = speaker_id_arr[0][0]
+                    if isinstance(raw_id, bytes):
+                        speaker_id = raw_id.decode("utf-8")
+                    else:
+                        speaker_id = str(raw_id)
+                except Exception:
+                    speaker_id = None
+
+            if speaker_id is None or speaker_id not in self.spk_info:
+                speaker_id = self.default_spk_id
+            current_spk_info = self.spk_info[speaker_id]
+
             # Extract input tensors
             wav = pb_utils.get_input_tensor_by_name(request, "reference_wav")
 
@@ -347,8 +372,8 @@ class TritonPythonModel:
                 prompt_spk_embedding = self.forward_speaker_embedding(wav_tensor)
             else:
                 # using pre-cached reference text
-                reference_text = self.default_spk_info["prompt_text"]
-                prompt_speech_tokens = self.default_spk_info["speech_token"] + ORIGINAL_VOCAB_SIZE
+                reference_text = current_spk_info["prompt_text"]
+                prompt_speech_tokens = current_spk_info["speech_token"] + ORIGINAL_VOCAB_SIZE
                 prompt_speech_feat = None
                 prompt_spk_embedding = None
 
