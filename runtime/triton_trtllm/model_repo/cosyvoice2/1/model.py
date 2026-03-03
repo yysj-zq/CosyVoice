@@ -83,15 +83,92 @@ class TritonPythonModel:
         spk_info_path = os.path.join(model_params["model_dir"], "spk2info.pt")
         if not os.path.exists(spk_info_path):
             raise ValueError(f"spk2info.pt not found in {model_params['model_dir']}")
-        spk_info = torch.load(spk_info_path, map_location="cpu", weights_only=False)
-        # Cache all speaker infos and determine default speaker id
-        self.spk_info = spk_info
-        if "001" in spk_info:
+        raw_spk_info = torch.load(spk_info_path, map_location="cpu", weights_only=False)
+        # Normalize speaker cache to one runtime format for both old/new spk2info schema.
+        self.spk_info = {}
+        for spk_id, profile in raw_spk_info.items():
+            self.spk_info[spk_id] = self._normalize_spk_profile(spk_id, profile)
+        if "001" in self.spk_info:
             self.default_spk_id = "001"
         else:
             # fall back to the first key in sorted order
-            self.default_spk_id = sorted(spk_info.keys())[0]
-        self.default_spk_info = spk_info[self.default_spk_id]
+            self.default_spk_id = sorted(self.spk_info.keys())[0]
+        self.default_spk_info = self.spk_info[self.default_spk_id]
+
+    def _as_tensor(self, value):
+        if torch.is_tensor(value):
+            return value
+        if isinstance(value, np.ndarray):
+            return torch.from_numpy(value)
+        return None
+
+    def _decode_prompt_text(self, spk_id, profile):
+        prompt_text = profile.get("prompt_text")
+        if isinstance(prompt_text, str):
+            return prompt_text
+        prompt_text_tensor = self._as_tensor(prompt_text)
+        if prompt_text_tensor is None:
+            self.logger.log_info(f"speaker '{spk_id}' has no decodable prompt_text, using empty string")
+            return ""
+        prompt_text_tensor = prompt_text_tensor.to(torch.int32).reshape(-1)
+        prompt_text_len = profile.get("prompt_text_len")
+        prompt_text_len_tensor = self._as_tensor(prompt_text_len)
+        if prompt_text_len_tensor is not None and prompt_text_len_tensor.numel() > 0:
+            valid_len = int(prompt_text_len_tensor.reshape(-1)[0].item())
+            prompt_text_tensor = prompt_text_tensor[:valid_len]
+        token_ids = prompt_text_tensor.tolist()
+        return self.tokenizer.decode(
+            token_ids,
+            skip_special_tokens=True,
+            clean_up_tokenization_spaces=False,
+        )
+
+    def _normalize_spk_profile(self, spk_id, profile):
+        if not isinstance(profile, dict):
+            raise ValueError(f"speaker '{spk_id}' profile must be dict, got {type(profile)}")
+        prompt_text = self._decode_prompt_text(spk_id, profile)
+
+        # New schema from cosyvoice.save_spkinfo(): llm_* and flow_* fields.
+        llm_prompt = self._as_tensor(profile.get("llm_prompt_speech_token"))
+        flow_prompt = self._as_tensor(profile.get("flow_prompt_speech_token"))
+        prompt_feat = self._as_tensor(profile.get("prompt_speech_feat"))
+        flow_embedding = self._as_tensor(profile.get("flow_embedding"))
+
+        if llm_prompt is None and flow_prompt is None:
+            # Old schema fallback: speech_token/speech_feat/embedding.
+            speech_token = self._as_tensor(profile.get("speech_token"))
+            speech_feat = self._as_tensor(profile.get("speech_feat"))
+            embedding = self._as_tensor(profile.get("embedding"))
+            if speech_token is None or speech_feat is None or embedding is None:
+                raise ValueError(
+                    f"speaker '{spk_id}' missing expected fields in spk2info profile"
+                )
+            llm_prompt = speech_token
+            flow_prompt = speech_token
+            prompt_feat = speech_feat
+            flow_embedding = embedding
+
+        if llm_prompt is None:
+            llm_prompt = flow_prompt
+        if flow_prompt is None:
+            flow_prompt = llm_prompt
+        if prompt_feat is None:
+            raise ValueError(f"speaker '{spk_id}' missing prompt_speech_feat/speech_feat")
+        if flow_embedding is None:
+            # Old schema has single embedding for both llm/flow.
+            flow_embedding = self._as_tensor(profile.get("llm_embedding"))
+            if flow_embedding is None:
+                flow_embedding = self._as_tensor(profile.get("embedding"))
+        if flow_embedding is None:
+            raise ValueError(f"speaker '{spk_id}' missing flow_embedding/embedding")
+
+        return {
+            "prompt_text": prompt_text,
+            "llm_prompt_speech_token": llm_prompt.to(torch.int32).contiguous(),
+            "flow_prompt_speech_token": flow_prompt.to(torch.int32).contiguous(),
+            "prompt_speech_feat": prompt_feat.to(torch.float16).contiguous(),
+            "flow_embedding": flow_embedding.to(torch.float16).contiguous(),
+        }
 
     def forward_llm(self, input_ids):
         """
@@ -347,6 +424,10 @@ class TritonPythonModel:
                     speaker_id = None
 
             if speaker_id is None or speaker_id not in self.spk_info:
+                if speaker_id is not None and speaker_id not in self.spk_info:
+                    self.logger.log_info(
+                        f"speaker_id '{speaker_id}' not found, fallback to default '{self.default_spk_id}'"
+                    )
                 speaker_id = self.default_spk_id
             current_spk_info = self.spk_info[speaker_id]
 
@@ -356,16 +437,17 @@ class TritonPythonModel:
             # Process reference audio through audio tokenizer
             if wav is not None:
                 wav_len = pb_utils.get_input_tensor_by_name(request, "reference_wav_len")
-                prompt_speech_tokens = self.forward_audio_tokenizer(wav, wav_len)
-                prompt_speech_tokens = prompt_speech_tokens.unsqueeze(0)
+                llm_prompt_speech_tokens = self.forward_audio_tokenizer(wav, wav_len)
+                llm_prompt_speech_tokens = llm_prompt_speech_tokens.unsqueeze(0)
 
                 wav_tensor = wav.as_numpy()
                 wav_tensor = torch.from_numpy(wav_tensor)[:, :wav_len.as_numpy()[0][0]]
                 prompt_speech_resample = torchaudio.transforms.Resample(orig_freq=16000, new_freq=24000)(wav_tensor)
                 speech_feat = self._extract_speech_feat(prompt_speech_resample)
-                token_len = min(int(speech_feat.shape[1] / 2), prompt_speech_tokens.shape[-1])
+                token_len = min(int(speech_feat.shape[1] / 2), llm_prompt_speech_tokens.shape[-1])
                 prompt_speech_feat = speech_feat[:, :2 * token_len].contiguous().half()
-                prompt_speech_tokens = prompt_speech_tokens[:, :token_len].contiguous()
+                llm_prompt_speech_tokens = llm_prompt_speech_tokens[:, :token_len].contiguous()
+                flow_prompt_speech_tokens = llm_prompt_speech_tokens
 
                 reference_text = pb_utils.get_input_tensor_by_name(request, "reference_text").as_numpy()
                 reference_text = reference_text[0][0].decode('utf-8')
@@ -373,9 +455,14 @@ class TritonPythonModel:
             else:
                 # using pre-cached reference text
                 reference_text = current_spk_info["prompt_text"]
-                prompt_speech_tokens = current_spk_info["speech_token"] + ORIGINAL_VOCAB_SIZE
-                prompt_speech_feat = None
-                prompt_spk_embedding = None
+                llm_prompt_speech_tokens = (
+                    current_spk_info["llm_prompt_speech_token"] + ORIGINAL_VOCAB_SIZE
+                ).to(torch.int32).contiguous()
+                flow_prompt_speech_tokens = (
+                    current_spk_info["flow_prompt_speech_token"] + ORIGINAL_VOCAB_SIZE
+                ).to(torch.int32).contiguous()
+                prompt_speech_feat = current_spk_info["prompt_speech_feat"]
+                prompt_spk_embedding = current_spk_info["flow_embedding"]
 
             target_text = pb_utils.get_input_tensor_by_name(request, "target_text").as_numpy()
             target_text = target_text[0][0].decode('utf-8')
@@ -384,7 +471,7 @@ class TritonPythonModel:
             input_ids = self.parse_input(
                 text=target_text,
                 prompt_text=reference_text,
-                prompt_speech_tokens=prompt_speech_tokens,
+                prompt_speech_tokens=llm_prompt_speech_tokens,
             )
 
             # Generate semantic tokens with LLM
@@ -419,7 +506,7 @@ class TritonPythonModel:
                         this_tts_speech_token = torch.tensor(this_tts_speech_token).unsqueeze(dim=0).to(torch.int32).to(self.device)
 
                         sub_tts_speech = self.forward_token2wav(
-                            this_tts_speech_token, token2wav_request_id, prompt_speech_tokens,
+                            this_tts_speech_token, token2wav_request_id, flow_prompt_speech_tokens,
                             prompt_speech_feat, prompt_spk_embedding, token_offset, False
                         )
 
@@ -454,7 +541,7 @@ class TritonPythonModel:
                         time.sleep(0.02)
 
                 this_tts_speech_token = torch.tensor(semantic_token_ids_arr).unsqueeze(dim=0).to(torch.int32).to(self.device)
-                sub_tts_speech = self.forward_token2wav(this_tts_speech_token, token2wav_request_id, prompt_speech_tokens, prompt_speech_feat, prompt_spk_embedding, token_offset, True)
+                sub_tts_speech = self.forward_token2wav(this_tts_speech_token, token2wav_request_id, flow_prompt_speech_tokens, prompt_speech_feat, prompt_spk_embedding, token_offset, True)
                 audio_tensor = pb_utils.Tensor.from_dlpack("waveform", to_dlpack(sub_tts_speech))
                 inference_response = pb_utils.InferenceResponse(output_tensors=[audio_tensor])
                 response_sender.send(inference_response)
@@ -468,7 +555,7 @@ class TritonPythonModel:
                 if generated_ids is None or len(generated_ids) == 0:
                     raise pb_utils.TritonModelException("Generated IDs is None or empty")
 
-                audio = self.forward_token2wav(generated_ids, token2wav_request_id, prompt_speech_tokens, prompt_speech_feat, prompt_spk_embedding)
+                audio = self.forward_token2wav(generated_ids, token2wav_request_id, flow_prompt_speech_tokens, prompt_speech_feat, prompt_spk_embedding)
 
                 # Prepare response
                 audio_tensor = pb_utils.Tensor.from_dlpack("waveform", to_dlpack(audio))
