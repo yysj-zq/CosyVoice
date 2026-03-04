@@ -190,15 +190,7 @@ class TritonPythonModel:
         if not os.path.exists(spk_info_path):
             raise ValueError(f"spk2info.pt not found in {model_dir}")
         spk_info = torch.load(spk_info_path, map_location="cpu", weights_only=False)
-        if "001" in spk_info:
-            default_spk_id = "001"
-        else:
-            default_spk_id = sorted(spk_info.keys())[0]
-            logger.warning(
-                "Speaker id '001' not found in spk2info.pt, fallback to '%s'",
-                default_spk_id,
-            )
-        self.default_spk_info = spk_info[default_spk_id]
+        self.default_spk_info = spk_info["001"]
 
         logger.info("Token2Wav initialized successfully")
 
