@@ -77,6 +77,62 @@ class CosyVoice:
     def save_spkinfo(self):
         torch.save(self.frontend.spk2info, '{}/spk2info.pt'.format(self.model_dir))
 
+    def save_spkinfo_for_triton(self, output_path=''):
+        """Save speaker cache in a Triton-compatible schema.
+
+        Triton runtime/triton_trtllm models expect each speaker entry to contain:
+        - prompt_text: str
+        - speech_token: Tensor[int]
+        - speech_feat: Tensor[float]
+        - embedding: Tensor[float]
+        """
+        if output_path == '':
+            output_path = '{}/spk2info_triton.pt'.format(self.model_dir)
+
+        triton_spk2info = {}
+        tokenizer = self.frontend.tokenizer
+
+        for spk_id, spk_info in self.frontend.spk2info.items():
+            if 'flow_prompt_speech_token' in spk_info:
+                speech_token = spk_info['flow_prompt_speech_token']
+            elif 'llm_prompt_speech_token' in spk_info:
+                speech_token = spk_info['llm_prompt_speech_token']
+            else:
+                raise ValueError('speaker {} missing speech token fields'.format(spk_id))
+
+            if 'prompt_speech_feat' not in spk_info:
+                raise ValueError('speaker {} missing prompt_speech_feat'.format(spk_id))
+            speech_feat = spk_info['prompt_speech_feat']
+
+            if 'flow_embedding' in spk_info:
+                embedding = spk_info['flow_embedding']
+            elif 'llm_embedding' in spk_info:
+                embedding = spk_info['llm_embedding']
+            else:
+                raise ValueError('speaker {} missing embedding fields'.format(spk_id))
+
+            if 'prompt_text' not in spk_info:
+                raise ValueError('speaker {} missing prompt_text'.format(spk_id))
+            prompt_text = spk_info['prompt_text']
+            if isinstance(prompt_text, torch.Tensor):
+                prompt_text_ids = prompt_text.detach().cpu().flatten().tolist()
+                prompt_text = tokenizer.decode(prompt_text_ids, skip_special_tokens=False)
+            elif isinstance(prompt_text, list):
+                prompt_text = tokenizer.decode(prompt_text, skip_special_tokens=False)
+            elif not isinstance(prompt_text, str):
+                raise ValueError('speaker {} prompt_text type {} is not supported'.format(spk_id, type(prompt_text)))
+
+            triton_spk2info[spk_id] = {
+                'prompt_text': prompt_text,
+                'speech_token': speech_token.detach().cpu().clone(),
+                'speech_feat': speech_feat.detach().cpu().clone(),
+                'embedding': embedding.detach().cpu().clone(),
+            }
+
+        torch.save(triton_spk2info, output_path)
+        logging.info('saved triton-compatible spkinfo to {}'.format(output_path))
+        return output_path
+
     def inference_sft(self, tts_text, spk_id, stream=False, speed=1.0, text_frontend=True):
         for i in tqdm(self.frontend.text_normalize(tts_text, split=True, text_frontend=text_frontend)):
             model_input = self.frontend.frontend_sft(i, spk_id)
