@@ -16,6 +16,8 @@ services:
             - driver: nvidia
               device_ids: ['0']
               capabilities: [gpu]
+    security_opt:
+      - seccomp=unconfined # key to wsl2+docker
     command: >
       # /bin/bash -c "tail -f /dev/null"
       /bin/bash -c "pip install modelscope && cd /workspace && git clone http://github.com/yysj-zq/CosyVoice.git && cd CosyVoice && git submodule update --init --recursive && cd runtime/triton_trtllm && bash run.sh 0 3"
