@@ -71,6 +71,7 @@ class CosyVoice:
         model_input = self.frontend.frontend_zero_shot('', prompt_text, prompt_wav, self.sample_rate, '')
         del model_input['text']
         del model_input['text_len']
+        model_input['prompt_text_raw'] = prompt_text
         self.frontend.spk2info[zero_shot_spk_id] = model_input
         return True
 
@@ -111,16 +112,20 @@ class CosyVoice:
             else:
                 raise ValueError('speaker {} missing embedding fields'.format(spk_id))
 
-            if 'prompt_text' not in spk_info:
-                raise ValueError('speaker {} missing prompt_text'.format(spk_id))
-            prompt_text = spk_info['prompt_text']
-            if isinstance(prompt_text, torch.Tensor):
-                prompt_text_ids = prompt_text.detach().cpu().flatten().tolist()
-                prompt_text = tokenizer.decode(prompt_text_ids, skip_special_tokens=False)
-            elif isinstance(prompt_text, list):
-                prompt_text = tokenizer.decode(prompt_text, skip_special_tokens=False)
-            elif not isinstance(prompt_text, str):
-                raise ValueError('speaker {} prompt_text type {} is not supported'.format(spk_id, type(prompt_text)))
+            # 优先使用保存的原始文本，避免再 decode
+            if 'prompt_text_raw' in spk_info:
+                prompt_text = spk_info['prompt_text_raw']
+            else:
+                if 'prompt_text' not in spk_info:
+                    raise ValueError('speaker {} missing prompt_text'.format(spk_id))
+                prompt_text = spk_info['prompt_text']
+                if isinstance(prompt_text, torch.Tensor):
+                    prompt_text_ids = prompt_text.detach().cpu().flatten().tolist()
+                    prompt_text = tokenizer.decode(prompt_text_ids)
+                elif isinstance(prompt_text, list):
+                    prompt_text = tokenizer.decode(prompt_text)
+                elif not isinstance(prompt_text, str):
+                    raise ValueError('speaker {} prompt_text type {} is not supported'.format(spk_id, type(prompt_text)))
 
             triton_spk2info[spk_id] = {
                 'prompt_text': prompt_text,
