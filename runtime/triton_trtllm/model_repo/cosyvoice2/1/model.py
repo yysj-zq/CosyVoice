@@ -84,14 +84,14 @@ class TritonPythonModel:
         if not os.path.exists(spk_info_path):
             raise ValueError(f"spk2info.pt not found in {model_params['model_dir']}")
         spk_info = torch.load(spk_info_path, map_location="cpu", weights_only=False)
-        # Cache all speaker infos and determine default speaker id
+        # Cache all speaker infos and determine default speaker id (no special handling for '001')
         self.spk_info = spk_info
-        if "001" in spk_info:
-            self.default_spk_id = "001"
-        else:
-            # fall back to the first key in sorted order
-            self.default_spk_id = sorted(spk_info.keys())[0]
-        self.default_spk_info = spk_info[self.default_spk_id]
+        # fall back to the first key in sorted order as default
+        self.default_spk_id = sorted(self.spk_info.keys())[0]
+        self.default_spk_info = self.spk_info[self.default_spk_id]
+        self.logger.log_info(
+            f"Loaded spk2info from {spk_info_path}, speakers={list(self.spk_info.keys())}, default_spk_id={self.default_spk_id}"
+        )
 
     def forward_llm(self, input_ids):
         """
@@ -263,9 +263,33 @@ class TritonPythonModel:
 
         if prompt_spk_embedding is not None:
             assert prompt_speech_feat is not None
-            prompt_speech_tokens_tensor = pb_utils.Tensor.from_dlpack("prompt_speech_tokens", to_dlpack(prompt_speech_tokens))
-            prompt_speech_feat_tensor = pb_utils.Tensor.from_dlpack("prompt_speech_feat", to_dlpack(prompt_speech_feat))
-            prompt_spk_embedding_tensor = pb_utils.Tensor.from_dlpack("prompt_spk_embedding", to_dlpack(prompt_spk_embedding))
+            # Ensure tensors are contiguous before exporting as DLPack
+            if not isinstance(prompt_speech_tokens, torch.Tensor):
+                prompt_speech_tokens = torch.as_tensor(prompt_speech_tokens)
+            if not isinstance(prompt_speech_feat, torch.Tensor):
+                prompt_speech_feat = torch.as_tensor(prompt_speech_feat)
+            if not isinstance(prompt_spk_embedding, torch.Tensor):
+                prompt_spk_embedding = torch.as_tensor(prompt_spk_embedding)
+
+            # Match token2wav model expectations: feat & embedding in fp16
+            if prompt_speech_feat.dtype != torch.float16:
+                prompt_speech_feat = prompt_speech_feat.to(torch.float16)
+            if prompt_spk_embedding.dtype != torch.float16:
+                prompt_spk_embedding = prompt_spk_embedding.to(torch.float16)
+
+            prompt_speech_tokens = prompt_speech_tokens.contiguous()
+            prompt_speech_feat = prompt_speech_feat.contiguous()
+            prompt_spk_embedding = prompt_spk_embedding.contiguous()
+
+            prompt_speech_tokens_tensor = pb_utils.Tensor.from_dlpack(
+                "prompt_speech_tokens", to_dlpack(prompt_speech_tokens)
+            )
+            prompt_speech_feat_tensor = pb_utils.Tensor.from_dlpack(
+                "prompt_speech_feat", to_dlpack(prompt_speech_feat)
+            )
+            prompt_spk_embedding_tensor = pb_utils.Tensor.from_dlpack(
+                "prompt_spk_embedding", to_dlpack(prompt_spk_embedding)
+            )
             inputs_tensor.extend([prompt_speech_tokens_tensor, prompt_speech_feat_tensor, prompt_spk_embedding_tensor])
 
         # Create and execute inference request
@@ -338,6 +362,7 @@ class TritonPythonModel:
             if speaker_id_tensor is not None:
                 try:
                     speaker_id_arr = speaker_id_tensor.as_numpy()
+                    self.logger.log_info(f"Raw speaker_id_tensor numpy={speaker_id_arr}")
                     raw_id = speaker_id_arr[0][0]
                     if isinstance(raw_id, bytes):
                         speaker_id = raw_id.decode("utf-8")
@@ -348,6 +373,9 @@ class TritonPythonModel:
 
             if speaker_id is None or speaker_id not in self.spk_info:
                 speaker_id = self.default_spk_id
+            self.logger.log_info(
+                f"Resolved speaker_id={speaker_id}, available_speakers={list(self.spk_info.keys())}"
+            )
             current_spk_info = self.spk_info[speaker_id]
 
             # Extract input tensors
@@ -371,11 +399,18 @@ class TritonPythonModel:
                 reference_text = reference_text[0][0].decode('utf-8')
                 prompt_spk_embedding = self.forward_speaker_embedding(wav_tensor)
             else:
-                # using pre-cached reference text
+                # using pre-cached reference text and cached speaker features
                 reference_text = current_spk_info["prompt_text"]
                 prompt_speech_tokens = current_spk_info["speech_token"] + ORIGINAL_VOCAB_SIZE
-                prompt_speech_feat = None
-                prompt_spk_embedding = None
+                # cached features / embeddings are already in correct dtype / device at save time
+                # here we keep them on CPU and let downstream move to target device
+                prompt_speech_feat = current_spk_info.get("speech_feat", None)
+                prompt_spk_embedding = current_spk_info.get("embedding", None)
+                self.logger.log_info(
+                    f"Using cached speaker features for speaker_id={speaker_id}, "
+                    f"has_speech_feat={prompt_speech_feat is not None}, "
+                    f"has_embedding={prompt_spk_embedding is not None}"
+                )
 
             target_text = pb_utils.get_input_tensor_by_name(request, "target_text").as_numpy()
             target_text = target_text[0][0].decode('utf-8')

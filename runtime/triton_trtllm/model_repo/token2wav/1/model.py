@@ -190,13 +190,16 @@ class TritonPythonModel:
         if not os.path.exists(spk_info_path):
             raise ValueError(f"spk2info.pt not found in {model_dir}")
         spk_info = torch.load(spk_info_path, map_location="cpu", weights_only=False)
-        if "001" in spk_info:
-            self.default_spk_id = "001"
-        else:
-            # fall back to the first key in sorted order
-            self.default_spk_id = sorted(spk_info.keys())[0]
-        self.default_spk_info = spk_info[self.default_spk_id]
-        logger.info("Token2Wav initialized successfully")
+        # Cache speaker infos and choose a stable default (no hardcoded '001')
+        self.spk_info = spk_info
+        self.default_spk_id = sorted(self.spk_info.keys())[0]
+        self.default_spk_info = self.spk_info[self.default_spk_id]
+
+        logger.info(
+            "Token2Wav initialized successfully, "
+            f"loaded spk2info from {spk_info_path}, speakers={list(self.spk_info.keys())}, "
+            f"default_spk_id={self.default_spk_id}"
+        )
 
     def execute(self, requests):
         """Execute inference on the batched requests.
@@ -215,6 +218,7 @@ class TritonPythonModel:
 
             prompt_speech_tokens_tensor = pb_utils.get_input_tensor_by_name(request, "prompt_speech_tokens")
             if prompt_speech_tokens_tensor is not None:
+                logger.info("token2wav received prompt_speech_tokens from upstream")
                 prompt_speech_tokens_tensor = prompt_speech_tokens_tensor.as_numpy()
                 prompt_speech_feat_tensor = pb_utils.get_input_tensor_by_name(request, "prompt_speech_feat").as_numpy()
                 prompt_spk_embedding_tensor = pb_utils.get_input_tensor_by_name(request, "prompt_spk_embedding").as_numpy()
@@ -223,6 +227,10 @@ class TritonPythonModel:
                 prompt_spk_embedding = torch.from_numpy(prompt_spk_embedding_tensor).to(self.device)
                 prompt_speech_tokens = prompt_speech_tokens - ORIGINAL_VOCAB_SIZE
             else:
+                logger.info(
+                    "token2wav did not receive prompt_speech_tokens; "
+                    f"falling back to default_spk_id={self.default_spk_id}"
+                )
                 prompt_speech_tokens = self.default_spk_info["speech_token"].to(self.device)
                 prompt_speech_feat = self.default_spk_info["speech_feat"].to(torch.float16).to(self.device)
                 prompt_spk_embedding = self.default_spk_info["embedding"].to(torch.float16).to(self.device)
